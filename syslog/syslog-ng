@@ -1,0 +1,83 @@
+## common
+source s_net {
+	udp6();
+	tcp6();
+};
+template t_company {
+	template("$ISODATE $FULLHOST <$FACILITY.$PRIORITY> $MSGHDR$MSGONLY\n");
+};
+
+## mac2addr
+destination d_sql_mac2addr {
+#       program("sh -c 'PGPASSFILE=/etc/syslog-ng/pgpass psql --no-readline --quiet --no-password --host=%SQL-SERVER% --log-file=/tmp/sql.log %DATABASE% %USERNAME% > /dev/null 2> /dev/null'"
+	program("sh -c 'PGPASSFILE=/etc/syslog-ng/pgpass psql --no-readline --quiet --no-password --host=%SQL-SERVER% %DATABASE% %USERNAME% > /dev/null 2> /dev/null'"
+		template("SELECT record_addr('$ISODATE', '${MAC2ADDR.MAC}', '${MAC2ADDR.ADDR}');\n"));
+};
+destination d_srv_ip {
+	file("%PATH-TO-FILE-OUTPUT%/$HOST/$YEAR$MONTH$DAY.log"
+		#fsync(yes)
+		template(t_company));
+};
+
+## SLAACer
+filter f_slaacer {
+	program("slaacer");
+};
+filter f_slaacer_hosts {
+	match("%SLAACER-SERVER%" value(HOST_FROM) type(string));
+};
+parser p_slaacer {
+	csv-parser(columns("MAC2ADDR.MAC", "MAC2ADDR.ADDR", "MAC2ADDR.TYPE")
+		delimiters(" ")
+		quote-pairs("[]")
+		flags(strip-whitespace));
+};
+filter f_slaacer_advert {
+	match("ADVERT" value(MAC2ADDR.TYPE) type(string) flags(substring))
+		and
+	match("solicited" value(MAC2ADDR.TYPE) type(string) flags(substring));
+};
+log {
+	source(s_net);
+	filter(f_slaacer);
+	filter(f_slaacer_hosts);
+	destination(d_srv_ip);
+	log {
+		parser(p_slaacer);
+		filter(f_slaacer_advert);
+		destination(d_sql_mac2addr);
+	};
+	flags(final);
+};
+
+## ISC DHCP IPv4 Hook
+filter f_dhcpd {
+	program(dhcpd);
+};
+filter f_dhcpd_hosts {
+	match("%DHCP-SERVER%" value(HOST_FROM) type(string));
+};
+parser p_dhcpd {
+	csv-parser(columns("MAC2ADDR.TYPE", "MAC2ADDR.DUMMY1", "MAC2ADDR.ADDR", "MAC2ADDR.DUMMY2", "MAC2ADDR.MAC", "MAC2ADDR.DUMMY3")
+		delimiters(" ()")
+		flags(strip-whitespace));
+};
+filter f_dhcpd_ack {
+	match("DHCPACK" value(MAC2ADDR.TYPE) type(string));
+};
+rewrite r_mac {
+	subst(":", "-", value(MAC2ADDR.MAC), flags(global));
+};
+log {
+	source(s_net);
+	filter(f_dhcpd);
+	filter(f_dhcpd_hosts);
+	destination(d_srv_ip);
+	log {
+		parser(p_dhcpd);
+		filter(f_dhcpd_ack);
+		rewrite(r_mac);
+		destination(d_sql_mac2addr);
+	};
+	flags(final);
+};

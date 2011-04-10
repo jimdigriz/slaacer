@@ -1,0 +1,60 @@
+-- DROP TABLE mac2addr;
+CREATE TABLE mac2addr
+(
+  id bigserial NOT NULL,
+  mac text NOT NULL,
+  addr inet NOT NULL,
+  "start" timestamp with time zone NOT NULL,
+  "last" timestamp with time zone NOT NULL,
+  CONSTRAINT mac2addr_id_primary PRIMARY KEY (id)
+)
+WITH (
+  OIDS=FALSE
+);
+ALTER TABLE mac2addr OWNER TO postgres;
+
+-- DROP INDEX mac2addr_addr;
+CREATE INDEX mac2addr_addr
+  ON mac2addr
+  USING btree
+  (addr);
+
+-- DROP INDEX mac2addr_last;
+CREATE INDEX mac2addr_last
+  ON mac2addr
+  USING btree
+  (last);
+
+-- DROP INDEX mac2addr_mac;
+CREATE INDEX mac2addr_mac
+  ON mac2addr
+  USING btree
+  (mac);
+
+-- DROP INDEX mac2addr_start;
+CREATE INDEX mac2addr_start
+  ON mac2addr
+  USING btree
+  (start);
+
+-- Functions
+CREATE LANGUAGE plpgsql
+CREATE OR REPLACE FUNCTION record_addr(ts timestamp with time zone, macaddr text, ipaddr inet) RETURNS int AS $$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN SELECT id, mac FROM mac2addr WHERE addr = ipaddr AND last > NOW() - '1 week'::interval ORDER BY last DESC LOOP
+    IF r.mac = macaddr THEN
+      UPDATE mac2addr SET last = ts WHERE id = r.id;
+      RETURN 1;
+    END IF;
+  END LOOP;
+
+  INSERT INTO mac2addr (mac, addr, start, last) VALUES (macaddr, ipaddr, ts, ts);
+  RETURN 0;
+END;
+$$ LANGUAGE plpgsql EXTERNAL SECURITY DEFINER;
+
+CREATE ROLE %USERNAME% LOGIN
+  ENCRYPTED PASSWORD '%PASSWORD%'
+  NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE;

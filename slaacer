@@ -1,0 +1,556 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+slaacer - IPv6 N(S|A) Recorder
+
+=cut
+
+use 5.010;
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+use POSIX qw/strftime/;
+use Errno qw/:POSIX/;
+use Sys::Syslog qw/:standard :macros/;
+use Net::Pcap 0.16 qw/:functions :datalink/;
+use IO::Poll;
+
+# /usr/include/sysexits.h
+# - would be nice to use sysexits.ph instead one day
+#BEGIN { require "sysexits.ph"; }
+use constant EX_OK		=> 0;	# successful termination
+use constant EX_USAGE		=> 64;	# command line usage error
+use constant EX_DATAERR		=> 65;	# data format error
+use constant EX_NOINPUT		=> 66;	# cannot open input
+use constant EX_NOUSER		=> 67;	# addressee unknown
+use constant EX_NOHOST		=> 68;	# host name unknown
+use constant EX_UNAVAILABLE	=> 69;	# service unavailable
+use constant EX_SOFTWARE	=> 70;	# internal software error
+use constant EX_OSERR		=> 71;	# system error (e.g., can't fork)
+use constant EX_OSFILE		=> 72;	# critical OS file missing
+use constant EX_CANTCREAT	=> 73;	# can't create (user) output file
+use constant EX_IOERR		=> 74;	# input/output error
+use constant EX_TEMPFAIL	=> 75;	# temp failure; user is invited to retry
+use constant EX_PROTOCOL	=> 76;	# remote error in protocol
+use constant EX_NOPERM		=> 77;	# permission denied
+use constant EX_CONFIG		=> 78;	# configuration error
+
+=head1 SYNOPSIS
+
+slaacer ( -i <interface> | -p file ) [options]
+
+=head1 OPTIONS
+
+=cut
+
+=over
+
+=item B<--help, -h>
+
+Print a brief help message and exits.
+
+=item B<--man>
+
+Prints the manual page and exits.
+
+=item B<--interface, -i>
+
+Listen for IPv6 ICMP packets on a particular interface.
+
+=item B<--debug, -d>
+
+Enable verbose debugging.
+
+=item B<--nofork, -n>
+
+Do not fork into background.
+
+=item B<--record=path, -R path>
+
+Path to place recordings in (default: /tmp).
+
+=item B<--playback=file, -P file>
+
+Playback a recorded PCAP file.
+
+Implies 'nofork' but does not syslog.
+
+=back
+
+=head1 DESCRIPTION
+
+B<This program> is all teh awesomes.
+
+=head1 DEPENDENCIES
+
+=over
+
+=item Net::Pcap 0.16 L<http://search.cpan.org/~saper/Net-Pcap/>
+
+=back
+
+=cut
+
+# not seen a packet larger than 86 bytes
+# FIXME setting to 86 bytes produces truncated packets of 78 bytes
+my $SNAPLEN = 96;
+
+my ($help, $man);
+my ($interface);
+my ($debug, $nofork);
+my ($record, $playback);
+
+GetOptions(
+	'help|h'	=> \$help,
+	'man'		=> \$man,
+
+	'interface|i=s'	=> \$interface,
+
+	'debug|d'	=> \$debug,
+	'nofork|n'	=> \$nofork,
+
+	'record|R=s'	=> \$record,
+	'playback|P=s'	=> \$playback,
+) or pod2usage(-exitstatus => EX_USAGE, -verbose => 2);
+
+pod2usage(-exitstatus => EX_OK, -verbose => 1)
+	if ($help);
+pod2usage(-exitstatus => EX_OK, -verbose => 2)
+	if ($man);
+
+if (defined($playback)) {
+	if (defined($interface)) {
+        	print STDERR "makes no sense to playback and supply interface\n";
+        	exit EX_USAGE;
+	}
+
+	$nofork = 1;
+} elsif (!defined($interface)) {
+	print STDERR "requires 'interface' (or 'playback') option\n";
+	exit EX_USAGE;
+}
+
+$record = '/tmp'
+	unless (defined($record));
+
+my ($dpcap, $err);
+my $pcap = (defined($interface))
+		? openlive($interface, \$err)
+		: pcap_open_offline($playback, \$err);
+
+exit -($pcap)
+	unless (ref $pcap eq 'pcap_tPtr');
+
+my $pcap_fd = pcap_get_selectable_fd($pcap);
+if ($pcap_fd == -1) {
+	print STDERR "$interface does not support select()/poll()\n";
+	pcap_close($pcap);
+	exit EX_OSERR;
+}
+
+# select()/poll() manpage says it is safer under Linux to use O_NONBLOCK
+if (pcap_setnonblock($pcap, 0, \$err)) {
+	print STDERR "unable to set nonblocking on fd: $err\n";
+	pcap_close($pcap);
+	exit EX_OSERR;
+}
+
+close STDIN;
+close STDOUT
+	unless (defined($playback));
+
+unless (defined($nofork)) {
+	my $pid = fork;
+	unless (defined($pid)) {
+		print STDERR "fork(): $!\n";
+		pcap_close($pcap);
+		exit EX_OSERR;
+	} elsif ($pid > 0) {
+		exit EX_OK;
+	}
+
+	if (POSIX::setsid() < 0) {
+		print STDERR "setsid(): $!\n";
+		pcap_close($pcap);
+		exit EX_OSERR;
+	}
+
+	unless (chdir('/')) {
+		print STDERR "chdir(\"/\"): $!\n";
+		pcap_close($pcap);
+		exit EX_OSERR;
+	}
+}
+
+openlog basename($0), 'pid', LOG_AUTH;
+
+close STDERR
+	unless (defined($nofork));
+
+&logmsg(LOG_INFO, 0, 'started')
+	unless (defined($playback));
+
+my $running = 1;
+$SIG{'TERM'} = $SIG{'INT'} = sub {
+	&logmsg(LOG_INFO, 0, "received SIG$_[0], closing down");
+	$running = 0;
+	pcap_breakloop($pcap);
+
+	$SIG{'TERM'} = $SIG{'INT'} = $SIG{'USR1'} = 'DEFAULT';
+};
+$SIG{'USR1'} = sub {
+	if (defined($dpcap)) {
+		my $rc = pcap_dump_flush($dpcap);
+		&logmsg(LOG_WARNING, 0, 'pcap_dump_flush() failed: ' . pcap_geterr($pcap))
+			if ($rc < 0);
+
+		pcap_dump_close($dpcap);
+		undef $dpcap;
+
+		&logmsg(LOG_INFO, 0, 'pcap dump file closed');
+	} else {
+		my $file = "$record/" . basename($0) . '.' . strftime('%FT%TZ', gmtime) . '.pcap';
+		$dpcap = pcap_dump_open($pcap, $file);
+		unless (defined($dpcap)) {
+			&logmsg(LOG_WARNING, 0, "pcap_dump_open('$file') failed: " . pcap_geterr($pcap));
+			return;
+		}
+
+		&logmsg(LOG_INFO, 0, "pcap dump file ('$file') opened");
+	}
+} unless (defined($playback));
+
+# https://rt.cpan.org/Public/Bug/Display.html?id=64878
+my $p = IO::Poll->new;
+$p->mask($pcap_fd => POLLIN);
+
+my $ret = EX_OK;
+while ($running) {
+	my $rc = $p->poll;
+	if ($rc == -1) {
+		next if ($! == EINTR);
+
+		print STDERR "poll(): $?\n";
+		$ret = EX_OSERR;
+		last;
+	}
+
+	$rc = pcap_dispatch($pcap, -1, \&pcap_cb, $dpcap);
+	if ($rc < 0) {
+		if ($rc == -1) {
+			logmsg(LOG_ERR, 0, 'pcap_dispatch() failed: ' . pcap_geterr($pcap));
+			$ret = EX_SOFTWARE;
+			last;
+		}
+	}
+	elsif ($rc == 0 && defined($playback)) {
+		last;
+	}
+}
+
+$SIG{'TERM'} = $SIG{'INT'} = $SIG{'USR1'} = 'DEFAULT';
+
+if (defined($dpcap)) {
+	my $rc = pcap_dump_flush($dpcap);
+	&logmsg(LOG_WARNING, 0, 'pcap_dump_flush() failed: ' . pcap_geterr($pcap))
+		if ($rc < 0);
+
+	pcap_dump_close($dpcap);
+
+	&logmsg(LOG_INFO, 0, 'pcap dump file closed');
+}
+
+pcap_close($pcap);
+
+&logmsg(LOG_INFO, 0, "exited with code $ret")
+	unless (defined($playback));
+
+closelog;
+
+exit $ret;
+
+sub logmsg {
+	my ($level, $epoch, $msg) = @_;
+
+	return if (!defined($debug) && $level == LOG_DEBUG);
+
+	if (defined($nofork)) {
+		if (defined($playback)) {
+			my $time = strftime('%b %d %T',
+				($epoch == 0) ? gmtime : gmtime($epoch));
+			print "$time: $msg\n";
+		} else {
+			my $time = strftime '%b %d %T', gmtime;
+			print STDERR "$time: $msg\n";
+		}
+	}
+
+	syslog $level, $msg
+		unless (defined($playback));
+}
+
+sub openlive {
+	my ($interface, $err) = @_;
+
+	my $pcap = pcap_open_live($interface, $SNAPLEN, 1, 0, $err);
+	unless (defined($pcap)) {
+		print STDERR "unable to open '$interface': $$err\n";
+		return -(EX_OSERR);
+	}
+
+	my $linktype = pcap_datalink($pcap);
+	unless ($linktype == DLT_EN10MB) {
+		print STDERR "sorry, this program only supports Ethernet\n";
+		pcap_close($pcap);
+		return -(EX_USAGE);
+	}
+
+	# we want all traffic that meets the following conditions, if it does not
+	# we are to drop it silently as per RFC4861 section 7.1:
+	# * IPv6
+	# * payload length is greater than or equal to 24 bytes (ip6[4:2]>=24)
+	# * ICMPv6 (ip6 proto 58)
+	# * hop limit set to 255 (ip6[7]=255)
+	# * either a:
+	#  * multicast neighbour solication (ip6[40]=135 and ip6 multicast)
+	#  * neighbour advertisement (ip6[40]=136)
+	# * ICMPv6 code 0 (ip6[41]=0)
+	#
+	# hints: http://www.chrisbrenton.org/2009/12/icmpv6-challenge-answers/
+	# N.B.	'protochain' does not create a kernel filter alas however
+	#	as the type of traffic we are after should not be chained
+	#	we do not care
+	#
+	# TODO report found bug in tcpdump optimiser (no packets with source '::')
+	# 'ip6 multicast and ip6 proto 58 and ip6[7] = 0xff and (ip6[40]=135 or ip6[40]=136)'
+	#
+	my $FILTER = 'ip6 and ip6[4:2]>=24 and ip6 proto 58 and ip6[7]=255 and '
+			. '((ip6[40]=135 and ip6 multicast) or ip6[40]=136) and ip6[41]=0';
+	my $filter;
+	if (pcap_compile($pcap, \$filter, $FILTER, 1, 0)) {
+		print STDERR 'pcap_compile() failed: ' . pcap_geterr($pcap) . "\n";
+		pcap_close($pcap);
+		return -(EX_OSERR);
+	}
+
+	if (pcap_setfilter($pcap, $filter)) {
+		print STDERR 'pcap_setfilter() failed: ' . pcap_geterr($pcap) . "\n";
+		pcap_freecode($filter);
+		pcap_close($pcap);
+		return -(EX_OSERR);
+	}
+
+	pcap_freecode($filter);
+
+	return $pcap;
+}
+
+sub pcap_cb {
+	my ($rec, $hdr, $pkt) = @_;
+
+	pcap_dump($rec, $hdr, $pkt)
+		if (defined($rec));
+
+	if ($hdr->{'len'} > $hdr->{'caplen'}) {
+		if ($hdr->{'len'} > $SNAPLEN) {
+			logmsg(LOG_ERR, $hdr->{'tv_sec'}, "phat packet ($hdr->{'len'}), please record and contact author");
+			$SNAPLEN = $hdr->{'len'};
+		}
+		logmsg(LOG_DEBUG, $hdr->{'tv_sec'}, 'incomplete captured packet, dropping');
+		return;
+	}
+
+	my ($mdst, $msrc, $ipsrc, $ipdst, $icmptype, $flags, $tgt, $ipay)
+			= unpack 'H12H12x10H32H32Cx3NH32a*', $pkt;
+
+	logmsg(LOG_DEBUG, $hdr->{'tv_sec'}, "recv $icmptype, $msrc->$mdst ($ipsrc->$ipdst [$tgt])");
+
+	if (&in6_cksum(substr($pkt, 14))) {
+		logmsg(LOG_DEBUG, $hdr->{'tv_sec'}, 'bad checksum, dropping');
+		return;
+	}
+	if (hex(substr($msrc, 1, 1)) & 0x1) {
+		logmsg(LOG_DEBUG, $hdr->{'tv_sec'}, 'mcast MAC source address, dropping');
+		return;
+	}
+	if (substr($ipsrc, 0, 1) eq 'ff') {
+		logmsg(LOG_DEBUG, $hdr->{'tv_sec'}, 'mcast IP source address, dropping');
+		return;
+	}
+
+	my @params = ($hdr->{'tv_sec'}, $msrc, $mdst, $ipsrc, $ipdst, $flags, $tgt, $ipay);
+	($icmptype == 135) ? sol(@params) : adv(@params);
+}
+
+sub sol {
+	my ($epoch, $msrc, $mdst, $ipsrc, $ipdst, $f, $tgt, $ipay) = @_;
+
+	unless (substr($mdst, 0, 6) eq '3333ff'
+			&& substr($ipdst, 0, 26) eq 'ff02' . '0'x18 . '01ff') {
+		logmsg(LOG_DEBUG, $epoch, 'invalid packet, dropping');
+		return;
+	}
+
+	if (substr($tgt, 0, 1) eq 'ff') {
+		logmsg(LOG_DEBUG, $epoch, 'mcast IP target address, dropping');
+		return;
+	}
+	unless (substr($tgt, -6) eq substr($ipdst, -6)) {
+		logmsg(LOG_DEBUG, $epoch, 'target != ipdst, dropping');
+		return;
+	}
+
+	# FIXME rewrite this, for now we only support the SLLA option
+	if (length($ipay) > 16) {
+		my ($type, $len, $slla) = unpack 'CCH12', substr($ipay, 16);
+		if ($type == 1 && $len == 8) {
+			unless ($msrc eq $slla) {
+				logmsg(LOG_DEBUG, $epoch, 'msrc != slla, dropping');
+				return;
+			}
+		}
+	}
+
+	my @flags = ('SOLICIT');
+
+	my $mac = &printable_mac($msrc);
+	my $ip;
+	if ($ipsrc eq '0'x32) {
+		$ip = &printable_ip($tgt);
+		push @flags, 'dad';
+	} else {
+		$ip = &printable_ip($ipsrc);
+	}
+	logmsg(LOG_NOTICE, $epoch, "$mac $ip [" . join(',', @flags) . ']');
+}
+
+sub adv {
+	my ($epoch, $msrc, $mdst, $ipsrc, $ipdst, $f, $tgt, $ipay) = @_;
+
+	if (substr($mdst, 0, 4) eq '3333' || substr($ipdst, 0, 2) eq 'ff') {
+		logmsg(LOG_DEBUG, $epoch, 'invalid packet, dropping');
+		return;
+	}
+
+	if (substr($tgt, 0, 1) eq 'ff') {
+		logmsg(LOG_DEBUG, $epoch, 'mcast IP target address, dropping');
+		return;
+	}
+	unless ($tgt eq $ipsrc) {
+		logmsg(LOG_DEBUG, $epoch, 'target != ipsrc, dropping');
+		return;
+	}
+
+	# FIXME rewrite this, for now we only support the TLLA option
+	if (length($ipay) > 16) {
+		my ($type, $len, $tlla) = unpack 'CCH12', substr($ipay, 20);
+		if ($type == 2 && $len == 8) {
+			unless ($msrc eq $tlla) {
+				logmsg(LOG_DEBUG, $epoch, 'msrc != tlla, dropping');
+				return;
+			}
+		}
+	}
+
+	my @flags = ('ADVERT');
+	push @flags, 'router'
+		if ($f & (1<<31));
+	push @flags, 'solicited'
+		if ($f & (1<<30));
+	push @flags, 'override'
+		if ($f & (1<<29));
+
+	my $mac = &printable_mac($msrc);
+	my $ip = &printable_ip($ipsrc);
+	logmsg(LOG_NOTICE, $epoch, "$mac $ip [" . join(',', @flags) . ']');
+}
+
+sub printable_mac {
+	my ($mac) = @_;
+
+	$mac =~ s/(.{2})(?!$)/$1-/g;
+
+	return $mac;
+}
+
+sub printable_ip {
+	my ($ip) = @_;
+
+	$ip =~ s/(.{4})(?!$)/$1:/g;
+	$ip =~ s/:0+/:/g;
+	$ip =~ s/:[0:]+:/::/;
+
+	return $ip;
+}
+
+sub in_cksum {
+	my ($buf) = @_;
+
+	my $sum = 0;
+
+	$sum += $_
+		for (unpack 'S*', $buf);
+
+	$sum += unpack 'C', substr($buf, -1)
+		if (length($buf) % 2);
+
+	$sum  = ($sum >> 16) + ($sum & 0xffff);
+	$sum += ($sum >> 16);
+	$sum  = ~$sum & 0xffff;
+
+	return $sum;
+}
+
+sub in6_cksum {
+	my ($buf) = @_;
+
+	my $len = unpack 'n', substr($buf, 4, 2);
+	my $hdr = unpack 'C', substr($buf, 6, 1);
+
+	$buf = pack('a32Nx3C', substr($buf, 8, 32),  $len, $hdr)
+			. substr($buf, 40);
+
+	return &in_cksum($buf);
+}
+
+=head1 CHANGELOG
+
+=over
+
+=item 20110111
+
+Initial Release
+
+=back
+
+=head1 BUGS AND LIMITATIONS
+
+cheese
+
+=head1 AUTHOR
+
+Alexander Clouter E<lt>L<alex@digriz.org.uk>E<gt>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2011  Alexander Clouter E<lt>L<alex@digriz.org.uk>E<gt>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but B<without any warranty>; without even the implied warranty of
+B<merchantability> or B<fitness for a particular purpose>.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see L<http://www.gnu.org/licenses/>.
+
+=cut
